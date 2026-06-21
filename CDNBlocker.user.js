@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili CDN Blocker
 // @namespace    https://github.com/lsy22/CDNBlocker
-// @version      1.1.0
+// @version      1.2.0
 // @description  屏蔽指定的 Bilibili CDN 主机，并可一键禁用 mcdn PCDN 节点。
 // @author       lsy223622
 // @license      GPL-3.0-or-later
@@ -23,6 +23,7 @@
     const BLOCKED_SINK = 'https://cdnblocker.invalid/blocked';
     const MCDN_ROOT = 'mcdn.bilivideo.cn';
     const P2P_TYPE_KEY = '__DASH_P2P_TYPE__';
+    const PLAYINFO_KEY = '__playinfo__';
     const BUTTON_CLASS = 'cdn-blocker-host-button';
     const STYLE_ID = 'cdn-blocker-style';
     const MODAL_ID = 'cdn-blocker-modal';
@@ -123,13 +124,129 @@
         }
     }
 
+    function hasBlockingRules() {
+        return config.blockMcdn || config.blockedHosts.length > 0;
+    }
+
+    function sanitizeUrlFields(representation, baseKey, backupKey) {
+        if (!Object.prototype.hasOwnProperty.call(representation, baseKey)) {
+            return null;
+        }
+
+        const primary = representation[baseKey];
+        const backups = Array.isArray(representation[backupKey])
+            ? representation[backupKey]
+            : [];
+        const allowed = [];
+        for (const candidate of [primary, ...backups]) {
+            if (
+                typeof candidate === 'string'
+                && candidate
+                && !shouldBlockUrl(candidate)
+                && !allowed.includes(candidate)
+            ) {
+                allowed.push(candidate);
+            }
+        }
+
+        if (allowed.length === 0) {
+            return false;
+        }
+
+        representation[baseKey] = allowed[0];
+        if (Object.prototype.hasOwnProperty.call(representation, backupKey)) {
+            representation[backupKey] = allowed.slice(1);
+        }
+        return true;
+    }
+
+    function sanitizeRepresentationList(list) {
+        if (!Array.isArray(list)) {
+            return list;
+        }
+
+        return list.filter((representation) => {
+            if (!representation || typeof representation !== 'object') {
+                return true;
+            }
+
+            const results = [
+                sanitizeUrlFields(representation, 'base_url', 'backup_url'),
+                sanitizeUrlFields(representation, 'baseUrl', 'backupUrl'),
+            ].filter((result) => result !== null);
+            return results.length === 0 || results.every(Boolean);
+        });
+    }
+
+    function isDashManifest(value) {
+        if (!value || typeof value !== 'object') {
+            return false;
+        }
+        const tracks = [value.video, value.audio].filter(Array.isArray);
+        return tracks.some((track) => track.some((representation) => (
+            representation
+            && typeof representation === 'object'
+            && (
+                Object.prototype.hasOwnProperty.call(representation, 'base_url')
+                || Object.prototype.hasOwnProperty.call(representation, 'baseUrl')
+            )
+        )));
+    }
+
+    function sanitizeDashManifest(dash) {
+        if (Array.isArray(dash.video)) {
+            dash.video = sanitizeRepresentationList(dash.video);
+        }
+        if (Array.isArray(dash.audio)) {
+            dash.audio = sanitizeRepresentationList(dash.audio);
+        }
+    }
+
+    function sanitizePlayurlPayload(payload) {
+        if (!hasBlockingRules() || !payload || typeof payload !== 'object') {
+            return payload;
+        }
+
+        const seen = new Set();
+        const containerKeys = ['data', 'result', 'dash', 'playurl', 'video_info', 'videoInfo'];
+        const visit = (value, depth) => {
+            if (!value || typeof value !== 'object' || seen.has(value) || depth > 6) {
+                return;
+            }
+            seen.add(value);
+            if (isDashManifest(value)) {
+                sanitizeDashManifest(value);
+            }
+            for (const key of containerKeys) {
+                if (Object.prototype.hasOwnProperty.call(value, key)) {
+                    visit(value[key], depth + 1);
+                }
+            }
+        };
+        visit(payload, 0);
+        return payload;
+    }
+
     function saveConfig(nextConfig) {
         config = sanitizeConfig(nextConfig);
         return Promise.resolve(GM_setValue(STORAGE_KEY, config));
     }
 
+    const blockingRulesActive = hasBlockingRules();
     const nativeXhrOpen = pageWindow.XMLHttpRequest.prototype.open;
+    const nativeXhrResponseDescriptor = Object.getOwnPropertyDescriptor(
+        pageWindow.XMLHttpRequest.prototype,
+        'response',
+    );
     const nativeFetch = typeof pageWindow.fetch === 'function' ? pageWindow.fetch : null;
+    const nativeJsonParse = pageWindow.JSON.parse;
+    const nativePlayinfoDescriptor = Object.getOwnPropertyDescriptor(pageWindow, PLAYINFO_KEY);
+    let playinfoGuardInstalled = false;
+    let guardedPlayinfo;
+    const guardedPlayinfoGetter = () => guardedPlayinfo;
+    const guardedPlayinfoSetter = (value) => {
+        guardedPlayinfo = sanitizePlayurlPayload(value);
+    };
 
     function patchedXhrOpen(method, url) {
         if (!shouldBlockUrl(url)) {
@@ -141,14 +258,89 @@
         return Reflect.apply(nativeXhrOpen, this, args);
     }
 
+    function isPlayurlRequest(input) {
+        const url = getUrlString(input);
+        return /(?:playurl|\/x\/player\/)/i.test(url);
+    }
+
+    function wrapPlayurlResponse(response) {
+        if (!response || typeof response.json !== 'function') {
+            return response;
+        }
+        try {
+            const nativeJson = response.json.bind(response);
+            Object.defineProperty(response, 'json', {
+                configurable: true,
+                value: () => nativeJson().then(sanitizePlayurlPayload),
+            });
+        } catch (_error) {
+            // JSON.parse and XHR hooks still cover the other common paths.
+        }
+        return response;
+    }
+
     function patchedFetch(input) {
         if (shouldBlockUrl(input)) {
             return Promise.reject(new TypeError(`${SCRIPT_NAME}: blocked CDN request`));
         }
-        return Reflect.apply(nativeFetch, this, arguments);
+        const result = Reflect.apply(nativeFetch, this, arguments);
+        return blockingRulesActive && isPlayurlRequest(input)
+            ? result.then(wrapPlayurlResponse)
+            : result;
     }
 
+    function patchedJsonParse(text, reviver) {
+        return sanitizePlayurlPayload(Reflect.apply(nativeJsonParse, this, arguments));
+    }
+
+    function patchedXhrResponseGetter() {
+        const response = Reflect.apply(nativeXhrResponseDescriptor.get, this, []);
+        return this.responseType === 'json' ? sanitizePlayurlPayload(response) : response;
+    }
+
+    function installPlayinfoGuard() {
+        if (!blockingRulesActive) {
+            return;
+        }
+
+        if (nativePlayinfoDescriptor && !nativePlayinfoDescriptor.configurable) {
+            sanitizePlayurlPayload(pageWindow[PLAYINFO_KEY]);
+            return;
+        }
+        if (nativePlayinfoDescriptor?.get || nativePlayinfoDescriptor?.set) {
+            sanitizePlayurlPayload(pageWindow[PLAYINFO_KEY]);
+            return;
+        }
+
+        guardedPlayinfo = sanitizePlayurlPayload(nativePlayinfoDescriptor?.value);
+        try {
+            Object.defineProperty(pageWindow, PLAYINFO_KEY, {
+                configurable: true,
+                enumerable: nativePlayinfoDescriptor?.enumerable ?? true,
+                get: guardedPlayinfoGetter,
+                set: guardedPlayinfoSetter,
+            });
+            playinfoGuardInstalled = true;
+        } catch (_error) {
+            // Subsequent playurl responses are still sanitized by the hooks below.
+        }
+    }
+
+    installPlayinfoGuard();
     pageWindow.XMLHttpRequest.prototype.open = patchedXhrOpen;
+    if (
+        blockingRulesActive
+        && nativeXhrResponseDescriptor?.get
+        && nativeXhrResponseDescriptor.configurable
+    ) {
+        Object.defineProperty(pageWindow.XMLHttpRequest.prototype, 'response', {
+            ...nativeXhrResponseDescriptor,
+            get: patchedXhrResponseGetter,
+        });
+    }
+    if (blockingRulesActive) {
+        pageWindow.JSON.parse = patchedJsonParse;
+    }
     if (nativeFetch) {
         pageWindow.fetch = patchedFetch;
     }
@@ -281,9 +473,9 @@
                 opacity: .55;
                 cursor: default;
             }
-            .${BUTTON_CLASS}.cdn-blocker-host-button--warning:disabled {
-                border-color: #f03e3e;
-                color: #ffb3b3;
+            .${BUTTON_CLASS}.cdn-blocker-host-button--pending:disabled {
+                border-color: #00a1d6;
+                color: #7dd9f5;
                 opacity: 1;
             }
             #${MODAL_ID} {
@@ -398,13 +590,13 @@
             button.dataset.host = host;
             const isMcdn = isMcdnHost(host);
             const blocked = isBlockedHost(host);
-            const failedRule = Boolean(host && blocked && (!isMcdn || config.blockMcdn));
-            button.disabled = !host || failedRule;
-            button.classList.toggle('cdn-blocker-host-button--warning', failedRule);
+            const waitingForSwitch = Boolean(host && blocked && (!isMcdn || config.blockMcdn));
+            button.disabled = !host || waitingForSwitch;
+            button.classList.toggle('cdn-blocker-host-button--pending', waitingForSwitch);
             const label = !host
                 ? '屏蔽'
-                : failedRule
-                    ? (isMcdn ? 'MCDN 屏蔽未生效' : '屏蔽未生效')
+                : waitingForSwitch
+                    ? '已屏蔽，等待切换'
                     : isMcdn
                         ? '屏蔽所有 MCDN'
                         : '屏蔽';
@@ -413,8 +605,8 @@
             }
             button.title = !host
                 ? '未检测到 CDN Host'
-                : failedRule
-                    ? `${host} 仍被播放器使用，请刷新或检查脚本是否在 document-start 运行`
+                : waitingForSwitch
+                    ? `${host} 已命中规则；统计面板可能保留上一分片的调度地址，等待下一分片后更新`
                     : isMcdn
                         ? '开启“禁用所有 mcdn 节点”并刷新播放器'
                         : `屏蔽 ${host}`;
@@ -607,8 +799,42 @@
         if (pageWindow.XMLHttpRequest.prototype.open === patchedXhrOpen) {
             pageWindow.XMLHttpRequest.prototype.open = nativeXhrOpen;
         }
+        const currentResponseDescriptor = Object.getOwnPropertyDescriptor(
+            pageWindow.XMLHttpRequest.prototype,
+            'response',
+        );
+        if (currentResponseDescriptor?.get === patchedXhrResponseGetter) {
+            Object.defineProperty(
+                pageWindow.XMLHttpRequest.prototype,
+                'response',
+                nativeXhrResponseDescriptor,
+            );
+        }
+        if (pageWindow.JSON.parse === patchedJsonParse) {
+            pageWindow.JSON.parse = nativeJsonParse;
+        }
         if (nativeFetch && pageWindow.fetch === patchedFetch) {
             pageWindow.fetch = nativeFetch;
+        }
+        const currentPlayinfoDescriptor = Object.getOwnPropertyDescriptor(pageWindow, PLAYINFO_KEY);
+        if (
+            playinfoGuardInstalled
+            && currentPlayinfoDescriptor?.get === guardedPlayinfoGetter
+            && currentPlayinfoDescriptor?.set === guardedPlayinfoSetter
+        ) {
+            if (nativePlayinfoDescriptor) {
+                Object.defineProperty(pageWindow, PLAYINFO_KEY, {
+                    ...nativePlayinfoDescriptor,
+                    value: guardedPlayinfo,
+                });
+            } else {
+                Object.defineProperty(pageWindow, PLAYINFO_KEY, {
+                    configurable: true,
+                    enumerable: true,
+                    writable: true,
+                    value: guardedPlayinfo,
+                });
+            }
         }
         if (p2pTypeGuardInstalled) {
             if (nativeP2pTypeDescriptor) {
