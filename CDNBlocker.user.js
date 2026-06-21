@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili CDN Blocker
 // @namespace    https://github.com/lsy22/CDNBlocker
-// @version      1.2.0
+// @version      1.3.0
 // @description  屏蔽指定的 Bilibili CDN 主机，并可一键禁用 mcdn PCDN 节点。
 // @author       lsy223622
 // @license      GPL-3.0-or-later
@@ -27,6 +27,7 @@
     const BUTTON_CLASS = 'cdn-blocker-host-button';
     const STYLE_ID = 'cdn-blocker-style';
     const MODAL_ID = 'cdn-blocker-modal';
+    const NOTICE_ID = 'cdn-blocker-notice';
     const DEFAULT_CONFIG = Object.freeze({
         version: 1,
         blockMcdn: false,
@@ -193,12 +194,78 @@
         )));
     }
 
-    function sanitizeDashManifest(dash) {
-        if (Array.isArray(dash.video)) {
-            dash.video = sanitizeRepresentationList(dash.video);
+    const allBlockedMediaTypes = new Set();
+    let noticeTimer = null;
+    let noticeWaitingForDom = false;
+
+    function dismissAllBlockedNotice() {
+        document.getElementById(NOTICE_ID)?.remove();
+        clearTimeout(noticeTimer);
+        noticeTimer = null;
+        allBlockedMediaTypes.clear();
+    }
+
+    function showAllBlockedNotice(mediaTypes) {
+        for (const mediaType of mediaTypes) {
+            allBlockedMediaTypes.add(mediaType);
         }
-        if (Array.isArray(dash.audio)) {
-            dash.audio = sanitizeRepresentationList(dash.audio);
+
+        const show = () => {
+            if (!document.body) {
+                if (!noticeWaitingForDom) {
+                    noticeWaitingForDom = true;
+                    document.addEventListener('DOMContentLoaded', show, { once: true });
+                }
+                return;
+            }
+            noticeWaitingForDom = false;
+
+            addStyle();
+            let notice = document.getElementById(NOTICE_ID);
+            if (!notice) {
+                notice = document.createElement('div');
+                notice.id = NOTICE_ID;
+                notice.setAttribute('role', 'status');
+                notice.setAttribute('aria-live', 'polite');
+
+                const message = document.createElement('span');
+                message.className = 'cdn-blocker-notice-message';
+                const closeButton = document.createElement('button');
+                closeButton.type = 'button';
+                closeButton.textContent = '×';
+                closeButton.setAttribute('aria-label', '关闭通知');
+                closeButton.addEventListener('click', dismissAllBlockedNotice);
+                notice.append(message, closeButton);
+                document.body.appendChild(notice);
+            }
+
+            const labels = [...allBlockedMediaTypes].map((type) => (
+                type === 'video' ? '视频' : '音频'
+            ));
+            notice.querySelector('.cdn-blocker-notice-message').textContent =
+                `${labels.join('和')}的所有可用 CDN 节点均已被屏蔽，请调整屏蔽规则。`;
+
+            clearTimeout(noticeTimer);
+            noticeTimer = setTimeout(dismissAllBlockedNotice, 8_000);
+        };
+
+        show();
+    }
+
+    function sanitizeDashManifest(dash) {
+        const emptiedMediaTypes = [];
+        for (const mediaType of ['video', 'audio']) {
+            if (!Array.isArray(dash[mediaType])) {
+                continue;
+            }
+            const hadRepresentations = dash[mediaType].length > 0;
+            dash[mediaType] = sanitizeRepresentationList(dash[mediaType]);
+            if (hadRepresentations && dash[mediaType].length === 0) {
+                emptiedMediaTypes.push(mediaType);
+            }
+        }
+        if (emptiedMediaTypes.length > 0) {
+            showAllBlockedNotice(emptiedMediaTypes);
         }
     }
 
@@ -477,6 +544,34 @@
                 border-color: #00a1d6;
                 color: #7dd9f5;
                 opacity: 1;
+            }
+            #${NOTICE_ID} {
+                position: fixed;
+                top: 22px;
+                right: 22px;
+                z-index: 1000001;
+                display: flex;
+                gap: 12px;
+                align-items: flex-start;
+                box-sizing: border-box;
+                max-width: min(420px, calc(100vw - 44px));
+                padding: 12px 14px;
+                border: 1px solid rgba(240, 62, 62, .35);
+                border-radius: 8px;
+                color: #18191c;
+                background: #fff;
+                box-shadow: 0 8px 30px rgba(0, 0, 0, .22);
+                font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            }
+            #${NOTICE_ID} .cdn-blocker-notice-message { min-width: 0; }
+            #${NOTICE_ID} button {
+                flex: none;
+                padding: 0;
+                border: 0;
+                color: #9499a0;
+                background: transparent;
+                font: 20px/18px sans-serif;
+                cursor: pointer;
             }
             #${MODAL_ID} {
                 position: fixed;
@@ -796,6 +891,7 @@
         document.querySelectorAll(`.${BUTTON_CLASS}`).forEach((button) => button.remove());
         document.getElementById(STYLE_ID)?.remove();
         document.getElementById(MODAL_ID)?.remove();
+        dismissAllBlockedNotice();
         if (pageWindow.XMLHttpRequest.prototype.open === patchedXhrOpen) {
             pageWindow.XMLHttpRequest.prototype.open = nativeXhrOpen;
         }
