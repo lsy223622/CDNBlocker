@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili CDN Blocker
 // @namespace    https://github.com/lsy22/CDNBlocker
-// @version      1.3.0
+// @version      1.4.0
 // @description  屏蔽指定的 Bilibili CDN 主机，并可一键禁用 mcdn PCDN 节点。
 // @author       lsy223622
 // @license      GPL-3.0-or-later
@@ -195,6 +195,7 @@
     }
 
     const allBlockedMediaTypes = new Set();
+    const blockedVideoQualities = new Set();
     let noticeTimer = null;
     let noticeWaitingForDom = false;
 
@@ -203,13 +204,10 @@
         clearTimeout(noticeTimer);
         noticeTimer = null;
         allBlockedMediaTypes.clear();
+        blockedVideoQualities.clear();
     }
 
-    function showAllBlockedNotice(mediaTypes) {
-        for (const mediaType of mediaTypes) {
-            allBlockedMediaTypes.add(mediaType);
-        }
-
+    function showBlockedNotice() {
         const show = () => {
             if (!document.body) {
                 if (!noticeWaitingForDom) {
@@ -242,8 +240,16 @@
             const labels = [...allBlockedMediaTypes].map((type) => (
                 type === 'video' ? '视频' : '音频'
             ));
-            notice.querySelector('.cdn-blocker-notice-message').textContent =
-                `${labels.join('和')}的所有可用 CDN 节点均已被屏蔽，请调整屏蔽规则。`;
+            const messages = [];
+            if (labels.length > 0) {
+                messages.push(
+                    `${labels.join('和')}的所有可用 CDN 节点均已被屏蔽，请调整屏蔽规则。`,
+                );
+            }
+            if (blockedVideoQualities.size > 0) {
+                messages.push('当前清晰度的所有 CDN 节点均已被屏蔽，播放器将尝试切换到较低清晰度。');
+            }
+            notice.querySelector('.cdn-blocker-notice-message').textContent = messages.join('\n');
 
             clearTimeout(noticeTimer);
             noticeTimer = setTimeout(dismissAllBlockedNotice, 8_000);
@@ -252,16 +258,42 @@
         show();
     }
 
-    function sanitizeDashManifest(dash) {
+    function showAllBlockedNotice(mediaTypes) {
+        for (const mediaType of mediaTypes) {
+            allBlockedMediaTypes.add(mediaType);
+        }
+        showBlockedNotice();
+    }
+
+    function showQualityFallbackNotice(quality) {
+        blockedVideoQualities.add(String(quality));
+        showBlockedNotice();
+    }
+
+    function sanitizeDashManifest(dash, currentQuality) {
         const emptiedMediaTypes = [];
         for (const mediaType of ['video', 'audio']) {
             if (!Array.isArray(dash[mediaType])) {
                 continue;
             }
+            const originalRepresentations = dash[mediaType];
             const hadRepresentations = dash[mediaType].length > 0;
-            dash[mediaType] = sanitizeRepresentationList(dash[mediaType]);
+            dash[mediaType] = sanitizeRepresentationList(originalRepresentations);
             if (hadRepresentations && dash[mediaType].length === 0) {
                 emptiedMediaTypes.push(mediaType);
+            }
+            if (
+                mediaType === 'video'
+                && currentQuality !== null
+                && currentQuality !== undefined
+                && dash.video.length > 0
+            ) {
+                const selectedRepresentation = originalRepresentations.find(
+                    (representation) => String(representation?.id) === String(currentQuality),
+                );
+                if (selectedRepresentation && !dash.video.includes(selectedRepresentation)) {
+                    showQualityFallbackNotice(currentQuality);
+                }
             }
         }
         if (emptiedMediaTypes.length > 0) {
@@ -276,17 +308,18 @@
 
         const seen = new Set();
         const containerKeys = ['data', 'result', 'dash', 'playurl', 'video_info', 'videoInfo'];
-        const visit = (value, depth) => {
+        const visit = (value, depth, inheritedQuality = null) => {
             if (!value || typeof value !== 'object' || seen.has(value) || depth > 6) {
                 return;
             }
             seen.add(value);
+            const currentQuality = value.quality ?? inheritedQuality;
             if (isDashManifest(value)) {
-                sanitizeDashManifest(value);
+                sanitizeDashManifest(value, currentQuality);
             }
             for (const key of containerKeys) {
                 if (Object.prototype.hasOwnProperty.call(value, key)) {
-                    visit(value[key], depth + 1);
+                    visit(value[key], depth + 1, currentQuality);
                 }
             }
         };
@@ -563,7 +596,7 @@
                 box-shadow: 0 8px 30px rgba(0, 0, 0, .22);
                 font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             }
-            #${NOTICE_ID} .cdn-blocker-notice-message { min-width: 0; }
+            #${NOTICE_ID} .cdn-blocker-notice-message { min-width: 0; white-space: pre-line; }
             #${NOTICE_ID} button {
                 flex: none;
                 padding: 0;
