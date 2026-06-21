@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Bilibili CDN Blocker
-// @namespace    https://github.com/lsy22/CDNBlocker
+// @namespace    https://github.com/lsy223622/CDNBlocker
 // @version      1.4.0
 // @description  屏蔽指定的 Bilibili CDN 主机，并可一键禁用 mcdn PCDN 节点。
 // @author       lsy223622
